@@ -1,7 +1,6 @@
 # Airseekers Tron — Home Assistant Custom Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/release/yourusername/ha-airseekers.svg)](https://github.com/yourusername/ha-airseekers/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A custom Home Assistant integration for the **Airseekers Tron** robot mower,
