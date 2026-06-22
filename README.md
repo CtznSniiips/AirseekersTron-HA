@@ -1,5 +1,9 @@
 # Airseekers Tron — Home Assistant Custom Integration
 
+[![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
+[![GitHub Release](https://img.shields.io/github/release/yourusername/ha-airseekers.svg)](https://github.com/yourusername/ha-airseekers/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A custom Home Assistant integration for the **Airseekers Tron** robot mower,
 reverse-engineered from the official Android app (v1.1.13).
 
@@ -47,14 +51,19 @@ reverse-engineered from the official Android app (v1.1.13).
 
 ## Installation
 
-1. Copy the `airseekers/` folder into `<config>/custom_components/`
-2. Install Python dependencies:
-   ```bash
-   pip install paho-mqtt aiohttp protobuf
-   ```
-3. Restart Home Assistant
-4. Go to **Settings → Devices & Services → Add Integration → Airseekers Tron**
-5. Enter your Airseekers app email and password
+### Via HACS (recommended)
+
+1. In HACS, click **⋮ → Custom repositories**
+2. Add `https://github.com/yourusername/ha-airseekers` as an **Integration**
+3. Search for **Airseekers Tron Mower** and click **Download**
+4. Restart Home Assistant
+5. Go to **Settings → Devices & Services → Add Integration → Airseekers Tron**
+
+### Manual
+
+1. Copy the `custom_components/airseekers/` folder into `<config>/custom_components/`
+2. Restart Home Assistant
+3. Go to **Settings → Devices & Services → Add Integration → Airseekers Tron**
 
 ---
 

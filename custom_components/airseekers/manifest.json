@@ -5,13 +5,10 @@
   "documentation": "https://github.com/yourusername/ha-airseekers",
   "issue_tracker": "https://github.com/yourusername/ha-airseekers/issues",
   "dependencies": [],
-  "codeowners": [],
+  "codeowners": ["@yourusername"],
   "requirements": [
-    "paho-mqtt>=1.6.1",
-    "aiohttp>=3.9.0",
-    "protobuf>=4.25.0"
+    "paho-mqtt>=1.6.1"
   ],
   "iot_class": "cloud_push",
-  "config_flow": true,
-  "quality_scale": "custom"
+  "config_flow": true
 }
