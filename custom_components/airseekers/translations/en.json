@@ -1,0 +1,31 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Airseekers Tron — Sign In",
+        "description": "Enter your Airseekers app credentials.",
+        "data": {
+          "email": "Email Address",
+          "password": "Password",
+          "region": "Region"
+        }
+      },
+      "device": {
+        "title": "Select Your Mower",
+        "description": "Multiple devices found on your account. Select the one to add.",
+        "data": {
+          "device_sn": "Device"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "cannot_connect": "Cannot reach the Airseekers cloud. Check your internet connection.",
+      "no_devices": "No devices found on this account. Bind your mower in the Airseekers app first.",
+      "unknown": "An unexpected error occurred. Check the HA logs."
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  }
+}

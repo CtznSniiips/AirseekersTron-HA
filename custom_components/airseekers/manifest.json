@@ -1,0 +1,17 @@
+{
+  "domain": "airseekers",
+  "name": "Airseekers Tron Mower",
+  "version": "0.1.0",
+  "documentation": "https://github.com/yourusername/ha-airseekers",
+  "issue_tracker": "https://github.com/yourusername/ha-airseekers/issues",
+  "dependencies": [],
+  "codeowners": [],
+  "requirements": [
+    "paho-mqtt>=1.6.1",
+    "aiohttp>=3.9.0",
+    "protobuf>=4.25.0"
+  ],
+  "iot_class": "cloud_push",
+  "config_flow": true,
+  "quality_scale": "custom"
+}
