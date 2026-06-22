@@ -1,21 +1,23 @@
 """
 Airseekers MQTT client.
 
-Connects to the eiotclub MQTT broker using credentials fetched from the REST API.
+Broker: AWS IoT Core (a26yx9tpysif9b-ats.iot.eu-central-1.amazonaws.com:8883)
+Auth:   Mutual TLS (mTLS) — no username/password
+Certs from /api/web/device/iot-cert response:
+  'ca'          → Amazon Root CA cert  (verify server identity)
+  'cert_key'    → Client certificate   (prove our identity to AWS IoT)
+  'private_key' → Private key          (for the client cert)
+  'mqtt_broker' → host:port
+  'mqtt_client_id' → MQTT client identifier
 
-Auth model (confirmed from libapp.so static analysis):
-  - Broker URL comes from iot-cert response: mqtt_broker field (host only, no scheme)
-  - Port comes from mqtt_broker field or defaults (1883 plain / 8883 TLS)
-  - Client ID: mqtt_client_id field
-  - Username: mqtt_client_id (same as client ID — eiotclub convention)
-  - Password: iot_cert_token field
-  - TLS: server-side only (iot_certificate = CA/server cert for verification)
-  - The private_key / cert_key fields appear to be for client-side TLS mutual auth;
-    try token-only auth first, fall back to mTLS if broker rejects.
+AWS IoT Core policy note:
+  The IoT policy attached to this certificate restricts which topics
+  can be subscribed/published. Only subscribe to as/{sn}/up.
+  Publishing to as/{sn}/down is for commands (once we know the format).
 
-Topic structure (best-guess — confirm with traffic capture):
-  Subscribe: as/{sn}/up
-  Publish:   as/{sn}/down
+Topic structure (confirmed from logs):
+  Subscribe: as/{sn}/up   — device → cloud (status, responses)
+  Publish:   as/{sn}/down — cloud → device (commands)
 """
 from __future__ import annotations
 
@@ -24,7 +26,6 @@ import logging
 import os
 import ssl
 import tempfile
-import threading
 from typing import Any
 from collections.abc import Callable
 
@@ -53,9 +54,6 @@ from .proto import (
     SensorStatusRsp,
     TaskStatusRsp,
     UpgradeStatusRsp,
-    build_get_network_req,
-    build_get_rtk_req,
-    build_get_status_req,
     build_go_dock_req,
     build_pause_task_req,
     build_resume_task_req,
@@ -74,19 +72,11 @@ except ImportError:
     HAS_PAHO = False
     _LOGGER.warning("paho-mqtt not installed; MQTT unavailable")
 
-StatusCallback = Callable[[str, Any], None]  # (device_sn, parsed_message)
+StatusCallback = Callable[[str, Any], None]
 
 
 class AirseekersDeviceMQTT:
-    """
-    MQTT connection for a single Airseekers device.
-
-    Usage:
-        client = AirseekersDeviceMQTT(sn, cert_info, on_status)
-        await client.async_connect()
-        await client.async_start_task(task_id)
-        await client.async_disconnect()
-    """
+    """MQTT connection for a single Airseekers device via AWS IoT Core."""
 
     def __init__(
         self,
@@ -100,7 +90,6 @@ class AirseekersDeviceMQTT:
         self._on_message = on_message
         self._loop = loop or asyncio.get_event_loop()
 
-        # Single paho client — never replaced after creation
         self._client: Any = None
         self._connected = False
         self._connect_lock = asyncio.Lock()
@@ -108,7 +97,6 @@ class AirseekersDeviceMQTT:
         self._shutdown = False
         self._temp_cert_dir: str | None = None
 
-        # Topics
         self._topic_up   = MQTT_TOPIC_UP_FMT.format(sn=device_sn)
         self._topic_down = MQTT_TOPIC_DOWN_FMT.format(sn=device_sn)
 
@@ -121,22 +109,15 @@ class AirseekersDeviceMQTT:
         return self._connected
 
     async def async_connect(self) -> bool:
-        """Connect to MQTT broker. Returns True on success."""
         if not HAS_PAHO:
-            _LOGGER.error("paho-mqtt not installed; cannot connect to MQTT")
+            _LOGGER.error("paho-mqtt not installed")
             return False
-
         async with self._connect_lock:
-            if self._connected:
-                return True
-            if self._client is not None:
-                # Already have a client — just ensure loop is running
+            if self._connected or self._client is not None:
                 return self._connected
-
             return await self._loop.run_in_executor(None, self._build_and_connect)
 
     async def async_disconnect(self) -> None:
-        """Disconnect cleanly and cancel reconnect."""
         self._shutdown = True
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
@@ -151,7 +132,7 @@ class AirseekersDeviceMQTT:
         self._cleanup_certs()
 
     # ------------------------------------------------------------------
-    # Commands — publish protobuf messages to device
+    # Commands
     # ------------------------------------------------------------------
 
     async def async_start_task(self, task_id: str, map_id: str | None = None) -> None:
@@ -169,40 +150,31 @@ class AirseekersDeviceMQTT:
     async def async_return_to_dock(self) -> None:
         await self._publish(build_go_dock_req())
 
-    async def async_poll_status(self) -> None:
-        await self._publish(build_get_status_req())
-
-    async def async_poll_network(self) -> None:
-        await self._publish(build_get_network_req())
-
-    async def async_poll_rtk(self) -> None:
-        await self._publish(build_get_rtk_req())
-
     # ------------------------------------------------------------------
-    # Internal — connection build (runs in executor, called once)
+    # Internal — connection
     # ------------------------------------------------------------------
 
     def _build_and_connect(self) -> bool:
-        """Build paho client and connect. Runs in executor thread."""
+        """Build paho client with AWS IoT mTLS and connect."""
         cert = self._cert_info
-        broker_raw = cert.get("mqtt_broker", "")
-        client_id  = cert.get("mqtt_client_id", f"ha_{self._sn}")
-        token      = cert.get("iot_cert_token", "")
-        ca_cert    = cert.get("iot_certificate") or cert.get("cert_key")
-        priv_key   = cert.get("private_key")
+
+        broker_raw   = cert.get("mqtt_broker", "")
+        client_id    = cert.get("mqtt_client_id", f"ha_{self._sn}")
+        # AWS IoT cert fields (confirmed from API response + APK analysis):
+        ca_cert      = cert.get("ca", "")           # Amazon Root CA → server verification
+        client_cert  = cert.get("cert_key", "") or cert.get("iot_certificate", "")  # our client cert
+        private_key  = cert.get("private_key", "")  # our private key
 
         if not broker_raw:
             _LOGGER.error("[%s] No mqtt_broker in iot-cert response", self._sn)
             return False
 
-        # Parse host and port from broker string
-        # Possible formats: "host", "host:port", "ssl://host:port"
         host, port = self._parse_broker(broker_raw)
-        use_tls = port == 8883 or "ssl" in broker_raw or "tls" in broker_raw
-
         _LOGGER.info(
-            "[%s] Connecting to MQTT broker raw=%r host=%s port=%s tls=%s client_id=%s token_set=%s",
-            self._sn, broker_raw, host, port, use_tls, client_id, bool(token),
+            "[%s] Connecting to AWS IoT Core %s:%s client_id=%s "
+            "ca=%s client_cert=%s key=%s",
+            self._sn, host, port, client_id,
+            bool(ca_cert), bool(client_cert), bool(private_key),
         )
 
         client = mqtt.Client(
@@ -214,49 +186,41 @@ class AirseekersDeviceMQTT:
         client.on_disconnect = self._on_disconnect
         client.on_message    = self._on_mqtt_message
 
-        # Auth: username = client_id, password = iot_cert_token
-        # (eiotclub token-based auth — confirmed by _clientToken field in ASMqttClient)
-        if token:
-            client.username_pw_set(username=client_id, password=token)
-            _LOGGER.debug("[%s] Using token auth (username=%s)", self._sn, client_id)
+        # AWS IoT Core uses mTLS — no username/password
+        try:
+            ssl_ctx = ssl.create_default_context()
 
-        # TLS: server cert verification using iot_certificate as CA
-        if use_tls:
-            try:
-                ssl_ctx = ssl.create_default_context()
-                if ca_cert:
-                    ca_path = self._write_temp_cert(ca_cert, "ca.crt")
-                    if ca_path:
-                        ssl_ctx.load_verify_locations(ca_path)
-                        _LOGGER.debug("[%s] Loaded CA cert for server verification", self._sn)
-                    else:
-                        # CA cert write failed — use system CAs with relaxed verification
-                        ssl_ctx.check_hostname = False
-                        ssl_ctx.verify_mode = ssl.CERT_NONE
-                        _LOGGER.warning(
-                            "[%s] Could not write CA cert, disabling cert verification", self._sn
-                        )
+            # Load Amazon Root CA for server cert verification
+            if ca_cert:
+                ca_path = self._write_temp("ca.crt", self._ensure_pem(ca_cert))
+                if ca_path:
+                    ssl_ctx.load_verify_locations(ca_path)
+                    _LOGGER.debug("[%s] Loaded Amazon Root CA", self._sn)
                 else:
-                    # No CA cert provided — trust system CAs
-                    _LOGGER.debug("[%s] No CA cert, using system trust store", self._sn)
+                    _LOGGER.warning("[%s] Failed to write CA cert, using system trust", self._sn)
+            else:
+                _LOGGER.warning("[%s] No CA cert in response — using system trust store", self._sn)
 
-                # Client cert auth (mTLS) — only if both cert and key are provided
-                # and cert looks like a PEM cert (not a token string)
-                if priv_key and ca_cert and "BEGIN" in str(ca_cert):
-                    cert_path = self._write_temp_cert(ca_cert, "client.crt")
-                    key_path  = self._write_temp_cert(priv_key, "client.key", is_key=True)
-                    if cert_path and key_path:
-                        try:
-                            ssl_ctx.load_cert_chain(cert_path, key_path)
-                            _LOGGER.debug("[%s] Loaded mTLS client cert", self._sn)
-                        except Exception as e:
-                            _LOGGER.debug("[%s] mTLS cert load failed: %s", self._sn, e)
+            # Load client cert + key for mTLS
+            if client_cert and private_key:
+                cert_path = self._write_temp("client.crt", self._ensure_pem(client_cert))
+                key_path  = self._write_temp("client.key", self._ensure_pem(private_key, is_key=True))
+                if cert_path and key_path:
+                    ssl_ctx.load_cert_chain(cert_path, key_path)
+                    _LOGGER.debug("[%s] Loaded mTLS client cert + key", self._sn)
+                else:
+                    _LOGGER.warning("[%s] Failed to write client cert/key files", self._sn)
+            else:
+                _LOGGER.warning(
+                    "[%s] Missing client cert (%s) or key (%s) — mTLS incomplete",
+                    self._sn, bool(client_cert), bool(private_key),
+                )
 
-                client.tls_set_context(ssl_ctx)
-            except Exception as err:
-                _LOGGER.warning("[%s] TLS setup failed: %s — trying plain TCP", self._sn, err)
-                use_tls = False
-                port = 1883
+            client.tls_set_context(ssl_ctx)
+
+        except Exception as err:
+            _LOGGER.error("[%s] TLS setup failed: %s", self._sn, err)
+            return False
 
         try:
             client.connect(host, port, keepalive=MQTT_KEEPALIVE)
@@ -265,32 +229,23 @@ class AirseekersDeviceMQTT:
             return False
 
         self._client = client
-        # loop_start() starts a single background thread — only called once
         client.loop_start()
         return True
 
     # ------------------------------------------------------------------
-    # Internal — paho callbacks (called on paho thread)
+    # Paho callbacks
     # ------------------------------------------------------------------
 
     def _on_connect(self, client: Any, userdata: Any, flags: Any, rc: int) -> None:
         if rc == 0:
-            _LOGGER.info("[%s] MQTT connected", self._sn)
+            _LOGGER.info("[%s] MQTT connected to AWS IoT Core", self._sn)
             self._connected = True
-            # Subscribe to both topic directions so we can sniff which one carries data.
-            # Device → cloud: as/{sn}/up  (we expect status updates here)
-            # Cloud → device: as/{sn}/down (commands go here, but also subscribe to confirm)
+            # Only subscribe to up (device→cloud). AWS IoT policy denies subscribing to down.
             client.subscribe(self._topic_up, qos=MQTT_QOS_STATUS)
             _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_up)
-            client.subscribe(self._topic_down, qos=MQTT_QOS_STATUS)
-            _LOGGER.debug("[%s] Subscribed to %s (diagnostic)", self._sn, self._topic_down)
-            # NOTE: Do NOT publish anything here.
-            # Sending an unverified protobuf payload causes the broker to
-            # drop the connection (RC=7) within ~90ms. Status updates arrive
-            # from the device automatically once subscribed.
         else:
             _LOGGER.error(
-                "[%s] MQTT connection refused (rc=%s): %s",
+                "[%s] MQTT connect refused rc=%s: %s",
                 self._sn, rc, _rc_description(rc),
             )
             self._connected = False
@@ -303,41 +258,36 @@ class AirseekersDeviceMQTT:
         self._connected = False
         if rc != 0:
             _LOGGER.warning(
-                "[%s] MQTT disconnected (rc=%s): %s",
+                "[%s] MQTT disconnected rc=%s: %s",
                 self._sn, rc, _rc_description(rc),
             )
             if was_connected:
-                # Only schedule reconnect once per disconnect event
                 self._maybe_schedule_reconnect()
         else:
             _LOGGER.debug("[%s] MQTT disconnected cleanly", self._sn)
 
     def _on_mqtt_message(self, client: Any, userdata: Any, msg: Any) -> None:
         _LOGGER.debug(
-            "[%s] Received %d bytes on topic %s qos=%s",
-            self._sn, len(msg.payload), msg.topic, msg.qos,
+            "[%s] Received %d bytes on %s: %s",
+            self._sn, len(msg.payload), msg.topic,
+            msg.payload.hex() if len(msg.payload) <= 64 else msg.payload[:64].hex() + "...",
         )
         try:
             parsed = self._parse_payload(msg.payload)
             if parsed is not None:
-                # Deliver to coordinator on the HA event loop thread
                 self._loop.call_soon_threadsafe(self._on_message, self._sn, parsed)
-            else:
-                _LOGGER.debug("[%s] Payload could not be parsed: %s", self._sn, msg.payload.hex())
         except Exception as err:
-            _LOGGER.debug("[%s] Failed to parse MQTT message on %s: %s", self._sn, msg.topic, err)
+            _LOGGER.debug("[%s] Parse error on %s: %s", self._sn, msg.topic, err)
 
     # ------------------------------------------------------------------
-    # Internal — reconnect (single task, guarded)
+    # Reconnect
     # ------------------------------------------------------------------
 
     def _maybe_schedule_reconnect(self) -> None:
-        """Schedule reconnect only if none is already pending. Safe to call from paho thread."""
         if self._shutdown:
             return
 
         def _schedule() -> None:
-            # Runs on the HA event loop thread — guarded against duplicate tasks
             if self._reconnect_task and not self._reconnect_task.done():
                 return
             self._reconnect_task = self._loop.create_task(self._reconnect_loop())
@@ -345,9 +295,6 @@ class AirseekersDeviceMQTT:
         self._loop.call_soon_threadsafe(_schedule)
 
     async def _reconnect_loop(self) -> None:
-        """Exponential backoff reconnect. Reuses the same paho client."""
-        if self._shutdown:
-            return
         delay = MQTT_RECONNECT_DELAY
         while not self._connected and not self._shutdown:
             _LOGGER.info("[%s] Reconnecting in %ss...", self._sn, delay)
@@ -356,29 +303,28 @@ class AirseekersDeviceMQTT:
                 return
             if not self._connected and self._client:
                 try:
-                    await self._loop.run_in_executor(
-                        None, lambda: self._client.reconnect()
-                    )
+                    await self._loop.run_in_executor(None, self._client.reconnect)
                 except Exception as err:
                     _LOGGER.debug("[%s] reconnect() failed: %s", self._sn, err)
             delay = min(delay * 2, 120)
 
     # ------------------------------------------------------------------
-    # Internal — publish
+    # Publish
     # ------------------------------------------------------------------
 
     async def _publish(self, payload: bytes) -> None:
         if not self._connected or not self._client:
             _LOGGER.debug("[%s] Cannot publish — not connected", self._sn)
             return
-        _LOGGER.debug("[%s] Publishing %d bytes to %s", self._sn, len(payload), self._topic_down)
+        _LOGGER.debug("[%s] Publishing %d bytes to %s: %s",
+                      self._sn, len(payload), self._topic_down, payload.hex())
         await self._loop.run_in_executor(
             None,
             lambda: self._client.publish(self._topic_down, payload, qos=MQTT_QOS_CMD),
         )
 
     # ------------------------------------------------------------------
-    # Internal — message parsing
+    # Message parsing
     # ------------------------------------------------------------------
 
     def _parse_payload(self, data: bytes) -> Any:
@@ -403,7 +349,6 @@ class AirseekersDeviceMQTT:
             except Exception as err:
                 _LOGGER.debug("[%s] Parser for msg_type=%s failed: %s", self._sn, msg_type, err)
 
-        # Unknown — return raw fields for debugging / calibration
         try:
             raw = decode_raw(data)
             if raw:
@@ -413,13 +358,11 @@ class AirseekersDeviceMQTT:
         return None
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Cert helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_broker(broker: str) -> tuple[str, int]:
-        """Parse 'host', 'host:port', or 'ssl://host:port' → (host, port)."""
-        # Strip scheme if present
         for scheme in ("ssl://", "tls://", "mqtts://", "mqtt://", "tcp://"):
             if broker.startswith(scheme):
                 broker = broker[len(scheme):]
@@ -432,25 +375,22 @@ class AirseekersDeviceMQTT:
                 pass
         return broker, MQTT_DEFAULT_PORT
 
-    def _write_temp_cert(self, content: str, filename: str, is_key: bool = False) -> str | None:
-        """Write a PEM string to a temp file. Returns path or None on failure."""
+    def _write_temp(self, filename: str, content: str) -> str | None:
         if not content:
             return None
         try:
             if self._temp_cert_dir is None:
                 self._temp_cert_dir = tempfile.mkdtemp(prefix="airseekers_")
             path = os.path.join(self._temp_cert_dir, filename)
-            pem = self._ensure_pem(content, is_key)
             with open(path, "w") as f:
-                f.write(pem)
+                f.write(content)
             return path
         except Exception as err:
-            _LOGGER.debug("[%s] Failed to write temp cert %s: %s", self._sn, filename, err)
+            _LOGGER.debug("[%s] Failed to write %s: %s", self._sn, filename, err)
             return None
 
     @staticmethod
     def _ensure_pem(content: str, is_key: bool = False) -> str:
-        """Wrap bare base64 in PEM headers if needed."""
         content = content.strip()
         if content.startswith("-----"):
             return content + "\n"
@@ -465,10 +405,6 @@ class AirseekersDeviceMQTT:
             self._temp_cert_dir = None
 
 
-# ------------------------------------------------------------------
-# RC code descriptions for better log messages
-# ------------------------------------------------------------------
-
 def _rc_description(rc: int) -> str:
     return {
         0: "success",
@@ -477,7 +413,6 @@ def _rc_description(rc: int) -> str:
         3: "server unavailable",
         4: "bad username or password",
         5: "not authorised",
-        6: "reserved",
         7: "connection lost / broker closed connection",
         8: "keepalive timeout",
     }.get(rc, f"unknown rc={rc}")

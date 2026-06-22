@@ -207,7 +207,7 @@ class AirseekersCoordinator(DataUpdateCoordinator):
                 sn,
                 cert_info.get("mqtt_broker"),
                 cert_info.get("mqtt_client_id"),
-                bool(cert_info.get("iot_certificate") or cert_info.get("cert_key")),
+                bool(cert_info.get("ca") or cert_info.get("iot_certificate") or cert_info.get("cert_key")),
             )
         except Exception as err:
             _LOGGER.warning("[%s] Could not fetch IoT cert: %s — MQTT unavailable", sn, err)
