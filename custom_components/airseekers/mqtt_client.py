@@ -1,16 +1,21 @@
 """
 Airseekers MQTT client.
 
-Connects to the eiotclub MQTT broker using per-device TLS client certificates
-fetched from the REST API. Publishes/subscribes to device topics carrying
-binary Protobuf payloads.
+Connects to the eiotclub MQTT broker using credentials fetched from the REST API.
 
-Topic structure (best-guess from static analysis — verify with traffic capture):
-  Subscribe (device → cloud):  as/{sn}/up
-  Publish   (cloud → device):  as/{sn}/down
+Auth model (confirmed from libapp.so static analysis):
+  - Broker URL comes from iot-cert response: mqtt_broker field (host only, no scheme)
+  - Port comes from mqtt_broker field or defaults (1883 plain / 8883 TLS)
+  - Client ID: mqtt_client_id field
+  - Username: mqtt_client_id (same as client ID — eiotclub convention)
+  - Password: iot_cert_token field
+  - TLS: server-side only (iot_certificate = CA/server cert for verification)
+  - The private_key / cert_key fields appear to be for client-side TLS mutual auth;
+    try token-only auth first, fall back to mTLS if broker rejects.
 
-The app calls publishGetOnlineStatus, publishGetTaskPath, etc. each pointing
-to its own method that wraps a protobuf message and publishes it.
+Topic structure (best-guess — confirm with traffic capture):
+  Subscribe: as/{sn}/up
+  Publish:   as/{sn}/down
 """
 from __future__ import annotations
 
@@ -19,9 +24,9 @@ import logging
 import os
 import ssl
 import tempfile
-import time
-from collections.abc import Callable
+import threading
 from typing import Any
+from collections.abc import Callable
 
 from .const import (
     MQTT_DEFAULT_PORT,
@@ -56,6 +61,7 @@ from .proto import (
     build_resume_task_req,
     build_start_task_req,
     build_stop_task_req,
+    decode_raw,
     parse_message,
 )
 
@@ -67,7 +73,6 @@ try:
 except ImportError:
     HAS_PAHO = False
     _LOGGER.warning("paho-mqtt not installed; MQTT unavailable")
-
 
 StatusCallback = Callable[[str, Any], None]  # (device_sn, parsed_message)
 
@@ -94,10 +99,13 @@ class AirseekersDeviceMQTT:
         self._cert_info = iot_cert_info
         self._on_message = on_message
         self._loop = loop or asyncio.get_event_loop()
-        self._client: Any = None  # paho Client
+
+        # Single paho client — never replaced after creation
+        self._client: Any = None
         self._connected = False
-        self._connecting = False
+        self._connect_lock = asyncio.Lock()
         self._reconnect_task: asyncio.Task | None = None
+        self._shutdown = False
         self._temp_cert_dir: str | None = None
 
         # Topics
@@ -118,21 +126,27 @@ class AirseekersDeviceMQTT:
             _LOGGER.error("paho-mqtt not installed; cannot connect to MQTT")
             return False
 
-        if self._connected or self._connecting:
-            return self._connected
+        async with self._connect_lock:
+            if self._connected:
+                return True
+            if self._client is not None:
+                # Already have a client — just ensure loop is running
+                return self._connected
 
-        self._connecting = True
-        try:
-            return await self._loop.run_in_executor(None, self._connect_sync)
-        finally:
-            self._connecting = False
+            return await self._loop.run_in_executor(None, self._build_and_connect)
 
     async def async_disconnect(self) -> None:
-        """Disconnect cleanly."""
-        if self._reconnect_task:
+        """Disconnect cleanly and cancel reconnect."""
+        self._shutdown = True
+        if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
-        if self._client and self._connected:
-            await self._loop.run_in_executor(None, self._client.disconnect)
+        if self._client:
+            try:
+                self._client.loop_stop()
+                if self._connected:
+                    self._client.disconnect()
+            except Exception:
+                pass
         self._connected = False
         self._cleanup_certs()
 
@@ -141,166 +155,199 @@ class AirseekersDeviceMQTT:
     # ------------------------------------------------------------------
 
     async def async_start_task(self, task_id: str, map_id: str | None = None) -> None:
-        """Start a mowing task."""
         await self._publish(build_start_task_req(task_id, map_id))
 
     async def async_stop_task(self) -> None:
-        """Stop current task."""
         await self._publish(build_stop_task_req())
 
     async def async_pause_task(self) -> None:
-        """Pause current task."""
         await self._publish(build_pause_task_req())
 
     async def async_resume_task(self) -> None:
-        """Resume paused task."""
         await self._publish(build_resume_task_req())
 
     async def async_return_to_dock(self) -> None:
-        """Send mower to charging dock."""
         await self._publish(build_go_dock_req())
 
     async def async_poll_status(self) -> None:
-        """Request a status update from the device."""
         await self._publish(build_get_status_req())
 
     async def async_poll_network(self) -> None:
-        """Request network info from the device."""
         await self._publish(build_get_network_req())
 
     async def async_poll_rtk(self) -> None:
-        """Request RTK data from the device."""
         await self._publish(build_get_rtk_req())
 
     # ------------------------------------------------------------------
-    # Internal — connection
+    # Internal — connection build (runs in executor, called once)
     # ------------------------------------------------------------------
 
-    def _connect_sync(self) -> bool:
-        """Blocking connect; run in executor."""
-        import paho.mqtt.client as mqtt
+    def _build_and_connect(self) -> bool:
+        """Build paho client and connect. Runs in executor thread."""
+        cert = self._cert_info
+        broker_raw = cert.get("mqtt_broker", "")
+        client_id  = cert.get("mqtt_client_id", f"ha_{self._sn}")
+        token      = cert.get("iot_cert_token", "")
+        ca_cert    = cert.get("iot_certificate") or cert.get("cert_key")
+        priv_key   = cert.get("private_key")
 
-        broker = self._cert_info.get("mqtt_broker", "")
-        client_id = self._cert_info.get("mqtt_client_id", f"ha_{self._sn}")
-        certificate = self._cert_info.get("iot_certificate") or self._cert_info.get("cert_key")
-        private_key = self._cert_info.get("private_key")
-        cert_token = self._cert_info.get("iot_cert_token")
-
-        if not broker:
-            _LOGGER.error("[%s] No MQTT broker in iot-cert response", self._sn)
+        if not broker_raw:
+            _LOGGER.error("[%s] No mqtt_broker in iot-cert response", self._sn)
             return False
 
-        # Parse host:port from broker string
-        port = MQTT_DEFAULT_PORT
-        host = broker
-        if ":" in broker:
-            parts = broker.rsplit(":", 1)
-            host = parts[0].lstrip("mqtt://").lstrip("mqtts://")
-            try:
-                port = int(parts[1])
-            except ValueError:
-                pass
+        # Parse host and port from broker string
+        # Possible formats: "host", "host:port", "ssl://host:port"
+        host, port = self._parse_broker(broker_raw)
+        use_tls = port == 8883 or "ssl" in broker_raw or "tls" in broker_raw
 
-        _LOGGER.info("[%s] Connecting to MQTT broker %s:%s", self._sn, host, port)
+        _LOGGER.info(
+            "[%s] Connecting to MQTT broker %s:%s tls=%s client_id=%s",
+            self._sn, host, port, use_tls, client_id,
+        )
 
-        client = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
+        client = mqtt.Client(
+            client_id=client_id,
+            protocol=mqtt.MQTTv311,
+            clean_session=True,
+        )
         client.on_connect    = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_message    = self._on_mqtt_message
 
-        # TLS client certificate auth
-        tls_configured = False
-        if certificate and private_key:
-            try:
-                self._temp_cert_dir = tempfile.mkdtemp(prefix="airseekers_")
-                cert_path = os.path.join(self._temp_cert_dir, "client.crt")
-                key_path  = os.path.join(self._temp_cert_dir, "client.key")
-                with open(cert_path, "w") as f:
-                    f.write(certificate if "\n" in certificate else self._pem_format(certificate))
-                with open(key_path, "w") as f:
-                    f.write(private_key if "\n" in private_key else self._pem_format(private_key, key=True))
-                client.tls_set(
-                    certfile=cert_path,
-                    keyfile=key_path,
-                    tls_version=ssl.PROTOCOL_TLS,
-                )
-                client.tls_insecure_set(False)
-                tls_configured = True
-                _LOGGER.debug("[%s] TLS client cert configured", self._sn)
-            except Exception as err:
-                _LOGGER.warning("[%s] Could not configure TLS cert: %s", self._sn, err)
+        # Auth: username = client_id, password = iot_cert_token
+        # (eiotclub token-based auth — confirmed by _clientToken field in ASMqttClient)
+        if token:
+            client.username_pw_set(username=client_id, password=token)
+            _LOGGER.debug("[%s] Using token auth (username=%s)", self._sn, client_id)
 
-        if not tls_configured:
-            # Fallback: token-based auth (if eiotclub uses username/password)
-            if cert_token:
-                client.username_pw_set(self._sn, cert_token)
+        # TLS: server cert verification using iot_certificate as CA
+        if use_tls:
             try:
-                client.tls_set(tls_version=ssl.PROTOCOL_TLS)
-                client.tls_insecure_set(True)  # for testing; remove in production
-            except Exception:
-                pass
+                ssl_ctx = ssl.create_default_context()
+                if ca_cert:
+                    ca_path = self._write_temp_cert(ca_cert, "ca.crt")
+                    if ca_path:
+                        ssl_ctx.load_verify_locations(ca_path)
+                        _LOGGER.debug("[%s] Loaded CA cert for server verification", self._sn)
+                    else:
+                        # CA cert write failed — use system CAs with relaxed verification
+                        ssl_ctx.check_hostname = False
+                        ssl_ctx.verify_mode = ssl.CERT_NONE
+                        _LOGGER.warning(
+                            "[%s] Could not write CA cert, disabling cert verification", self._sn
+                        )
+                else:
+                    # No CA cert provided — trust system CAs
+                    _LOGGER.debug("[%s] No CA cert, using system trust store", self._sn)
+
+                # Client cert auth (mTLS) — only if both cert and key are provided
+                # and cert looks like a PEM cert (not a token string)
+                if priv_key and ca_cert and "BEGIN" in str(ca_cert):
+                    cert_path = self._write_temp_cert(ca_cert, "client.crt")
+                    key_path  = self._write_temp_cert(priv_key, "client.key", is_key=True)
+                    if cert_path and key_path:
+                        try:
+                            ssl_ctx.load_cert_chain(cert_path, key_path)
+                            _LOGGER.debug("[%s] Loaded mTLS client cert", self._sn)
+                        except Exception as e:
+                            _LOGGER.debug("[%s] mTLS cert load failed: %s", self._sn, e)
+
+                client.tls_set_context(ssl_ctx)
+            except Exception as err:
+                _LOGGER.warning("[%s] TLS setup failed: %s — trying plain TCP", self._sn, err)
+                use_tls = False
+                port = 1883
 
         try:
             client.connect(host, port, keepalive=MQTT_KEEPALIVE)
         except Exception as err:
-            _LOGGER.error("[%s] MQTT connect failed: %s", self._sn, err)
+            _LOGGER.error("[%s] MQTT connect() failed: %s", self._sn, err)
             return False
 
         self._client = client
+        # loop_start() starts a single background thread — only called once
         client.loop_start()
         return True
 
+    # ------------------------------------------------------------------
+    # Internal — paho callbacks (called on paho thread)
+    # ------------------------------------------------------------------
+
     def _on_connect(self, client: Any, userdata: Any, flags: Any, rc: int) -> None:
-        """Paho connect callback."""
         if rc == 0:
             _LOGGER.info("[%s] MQTT connected", self._sn)
             self._connected = True
-            # Subscribe to device status topic
             client.subscribe(self._topic_up, qos=MQTT_QOS_STATUS)
             _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_up)
-            # Request initial status
-            self._loop.call_soon_threadsafe(
-                self._loop.create_task,
-                self.async_poll_status()
-            )
+            # Fire-and-forget initial status poll
+            asyncio.run_coroutine_threadsafe(self.async_poll_status(), self._loop)
         else:
-            _LOGGER.error("[%s] MQTT connect failed with rc=%s", self._sn, rc)
+            _LOGGER.error(
+                "[%s] MQTT connection refused (rc=%s): %s",
+                self._sn, rc, _rc_description(rc),
+            )
             self._connected = False
-            self._schedule_reconnect()
+            self._maybe_schedule_reconnect()
 
     def _on_disconnect(self, client: Any, userdata: Any, rc: int) -> None:
-        """Paho disconnect callback."""
-        _LOGGER.warning("[%s] MQTT disconnected (rc=%s)", self._sn, rc)
+        if self._shutdown:
+            return
+        was_connected = self._connected
         self._connected = False
         if rc != 0:
-            self._schedule_reconnect()
+            _LOGGER.warning(
+                "[%s] MQTT disconnected (rc=%s): %s",
+                self._sn, rc, _rc_description(rc),
+            )
+            if was_connected:
+                # Only schedule reconnect once per disconnect event
+                self._maybe_schedule_reconnect()
+        else:
+            _LOGGER.debug("[%s] MQTT disconnected cleanly", self._sn)
 
     def _on_mqtt_message(self, client: Any, userdata: Any, msg: Any) -> None:
-        """Paho message callback — parse protobuf and dispatch."""
         try:
             parsed = self._parse_payload(msg.payload)
             if parsed is not None:
-                self._loop.call_soon_threadsafe(
-                    self._on_message, self._sn, parsed
-                )
+                # Deliver to coordinator on the HA event loop thread
+                self._loop.call_soon_threadsafe(self._on_message, self._sn, parsed)
         except Exception as err:
-            _LOGGER.debug("[%s] Failed to parse MQTT message: %s", self._sn, err)
+            _LOGGER.debug("[%s] Failed to parse MQTT message on %s: %s", self._sn, msg.topic, err)
 
-    def _schedule_reconnect(self) -> None:
-        """Schedule a reconnect attempt."""
-        if self._reconnect_task and not self._reconnect_task.done():
+    # ------------------------------------------------------------------
+    # Internal — reconnect (single task, guarded)
+    # ------------------------------------------------------------------
+
+    def _maybe_schedule_reconnect(self) -> None:
+        """Schedule reconnect only if none is already pending. Safe to call from paho thread."""
+        if self._shutdown:
             return
-        self._reconnect_task = self._loop.create_task(self._reconnect_loop())
+
+        def _schedule() -> None:
+            # Runs on the HA event loop thread — guarded against duplicate tasks
+            if self._reconnect_task and not self._reconnect_task.done():
+                return
+            self._reconnect_task = self._loop.create_task(self._reconnect_loop())
+
+        self._loop.call_soon_threadsafe(_schedule)
 
     async def _reconnect_loop(self) -> None:
-        """Keep trying to reconnect with backoff."""
+        """Exponential backoff reconnect. Reuses the same paho client."""
+        if self._shutdown:
+            return
         delay = MQTT_RECONNECT_DELAY
-        while not self._connected:
+        while not self._connected and not self._shutdown:
             _LOGGER.info("[%s] Reconnecting in %ss...", self._sn, delay)
             await asyncio.sleep(delay)
-            connected = await self.async_connect()
-            if connected:
-                break
+            if self._shutdown:
+                return
+            if not self._connected and self._client:
+                try:
+                    await self._loop.run_in_executor(
+                        None, lambda: self._client.reconnect()
+                    )
+                except Exception as err:
+                    _LOGGER.debug("[%s] reconnect() failed: %s", self._sn, err)
             delay = min(delay * 2, 120)
 
     # ------------------------------------------------------------------
@@ -308,15 +355,13 @@ class AirseekersDeviceMQTT:
     # ------------------------------------------------------------------
 
     async def _publish(self, payload: bytes) -> None:
-        """Publish a command to the device's down topic."""
         if not self._connected or not self._client:
-            _LOGGER.warning("[%s] Cannot publish — not connected", self._sn)
+            _LOGGER.debug("[%s] Cannot publish — not connected", self._sn)
             return
-        topic = self._topic_down
-        _LOGGER.debug("[%s] Publishing %d bytes to %s", self._sn, len(payload), topic)
+        _LOGGER.debug("[%s] Publishing %d bytes to %s", self._sn, len(payload), self._topic_down)
         await self._loop.run_in_executor(
             None,
-            lambda: self._client.publish(topic, payload, qos=MQTT_QOS_CMD),
+            lambda: self._client.publish(self._topic_down, payload, qos=MQTT_QOS_CMD),
         )
 
     # ------------------------------------------------------------------
@@ -324,15 +369,11 @@ class AirseekersDeviceMQTT:
     # ------------------------------------------------------------------
 
     def _parse_payload(self, data: bytes) -> Any:
-        """Parse incoming protobuf payload into a typed object."""
         msg_type, payload = parse_message(data)
-        # If msg_type is 0, the outer envelope parse failed;
-        # we still try common types on the raw data so captures work
-        # even before field numbers are confirmed.
         decode_data = payload if isinstance(payload, bytes) and payload else data
 
         parsers = {
-            MSG_TYPE_TASK_STATUS:   TaskStatusRsp.from_bytes,
+            MSG_TYPE_TASK_STATUS:    TaskStatusRsp.from_bytes,
             MSG_TYPE_BATTERY_STATUS: BatteryStatusRsp.from_bytes,
             MSG_TYPE_SENSOR_STATUS:  SensorStatusRsp.from_bytes,
             MSG_TYPE_RTK_INFO:       RTKInfoRsp.from_bytes,
@@ -347,33 +388,83 @@ class AirseekersDeviceMQTT:
             try:
                 return parser(decode_data)
             except Exception as err:
-                _LOGGER.debug("[%s] Parser %s failed: %s", self._sn, msg_type, err)
+                _LOGGER.debug("[%s] Parser for msg_type=%s failed: %s", self._sn, msg_type, err)
 
-        # Unknown type — return raw dict so coordinator can log it
-        from .proto import decode_raw
+        # Unknown — return raw fields for debugging / calibration
         try:
-            return {"_raw_msg_type": msg_type, "_raw_fields": decode_raw(data)}
+            raw = decode_raw(data)
+            if raw:
+                return {"_raw_msg_type": msg_type, "_raw_fields": raw}
         except Exception:
-            return None
+            pass
+        return None
 
     # ------------------------------------------------------------------
-    # Cert helpers
+    # Helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _pem_format(b64: str, key: bool = False) -> str:
-        """Wrap a bare base64 string in PEM headers."""
-        label = "PRIVATE KEY" if key else "CERTIFICATE"
-        # Insert line breaks every 64 chars
-        chunks = [b64[i:i+64] for i in range(0, len(b64), 64)]
+    def _parse_broker(broker: str) -> tuple[str, int]:
+        """Parse 'host', 'host:port', or 'ssl://host:port' → (host, port)."""
+        # Strip scheme if present
+        for scheme in ("ssl://", "tls://", "mqtts://", "mqtt://", "tcp://"):
+            if broker.startswith(scheme):
+                broker = broker[len(scheme):]
+                break
+        if ":" in broker:
+            parts = broker.rsplit(":", 1)
+            try:
+                return parts[0], int(parts[1])
+            except ValueError:
+                pass
+        return broker, MQTT_DEFAULT_PORT
+
+    def _write_temp_cert(self, content: str, filename: str, is_key: bool = False) -> str | None:
+        """Write a PEM string to a temp file. Returns path or None on failure."""
+        if not content:
+            return None
+        try:
+            if self._temp_cert_dir is None:
+                self._temp_cert_dir = tempfile.mkdtemp(prefix="airseekers_")
+            path = os.path.join(self._temp_cert_dir, filename)
+            pem = self._ensure_pem(content, is_key)
+            with open(path, "w") as f:
+                f.write(pem)
+            return path
+        except Exception as err:
+            _LOGGER.debug("[%s] Failed to write temp cert %s: %s", self._sn, filename, err)
+            return None
+
+    @staticmethod
+    def _ensure_pem(content: str, is_key: bool = False) -> str:
+        """Wrap bare base64 in PEM headers if needed."""
+        content = content.strip()
+        if content.startswith("-----"):
+            return content + "\n"
+        label = "RSA PRIVATE KEY" if is_key else "CERTIFICATE"
+        chunks = [content[i:i+64] for i in range(0, len(content), 64)]
         return f"-----BEGIN {label}-----\n" + "\n".join(chunks) + f"\n-----END {label}-----\n"
 
     def _cleanup_certs(self) -> None:
-        """Remove temporary cert files."""
         if self._temp_cert_dir:
             import shutil
-            try:
-                shutil.rmtree(self._temp_cert_dir, ignore_errors=True)
-            except Exception:
-                pass
+            shutil.rmtree(self._temp_cert_dir, ignore_errors=True)
             self._temp_cert_dir = None
+
+
+# ------------------------------------------------------------------
+# RC code descriptions for better log messages
+# ------------------------------------------------------------------
+
+def _rc_description(rc: int) -> str:
+    return {
+        0: "success",
+        1: "incorrect protocol version",
+        2: "invalid client identifier",
+        3: "server unavailable",
+        4: "bad username or password",
+        5: "not authorised",
+        6: "reserved",
+        7: "connection lost / broker closed connection",
+        8: "keepalive timeout",
+    }.get(rc, f"unknown rc={rc}")
