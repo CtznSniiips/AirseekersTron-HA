@@ -201,8 +201,8 @@ class AirseekersDeviceMQTT:
         use_tls = port == 8883 or "ssl" in broker_raw or "tls" in broker_raw
 
         _LOGGER.info(
-            "[%s] Connecting to MQTT broker %s:%s tls=%s client_id=%s",
-            self._sn, host, port, use_tls, client_id,
+            "[%s] Connecting to MQTT broker raw=%r host=%s port=%s tls=%s client_id=%s token_set=%s",
+            self._sn, broker_raw, host, port, use_tls, client_id, bool(token),
         )
 
         client = mqtt.Client(
@@ -277,10 +277,17 @@ class AirseekersDeviceMQTT:
         if rc == 0:
             _LOGGER.info("[%s] MQTT connected", self._sn)
             self._connected = True
+            # Subscribe to both topic directions so we can sniff which one carries data.
+            # Device → cloud: as/{sn}/up  (we expect status updates here)
+            # Cloud → device: as/{sn}/down (commands go here, but also subscribe to confirm)
             client.subscribe(self._topic_up, qos=MQTT_QOS_STATUS)
             _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_up)
-            # Fire-and-forget initial status poll
-            asyncio.run_coroutine_threadsafe(self.async_poll_status(), self._loop)
+            client.subscribe(self._topic_down, qos=MQTT_QOS_STATUS)
+            _LOGGER.debug("[%s] Subscribed to %s (diagnostic)", self._sn, self._topic_down)
+            # NOTE: Do NOT publish anything here.
+            # Sending an unverified protobuf payload causes the broker to
+            # drop the connection (RC=7) within ~90ms. Status updates arrive
+            # from the device automatically once subscribed.
         else:
             _LOGGER.error(
                 "[%s] MQTT connection refused (rc=%s): %s",
@@ -306,11 +313,17 @@ class AirseekersDeviceMQTT:
             _LOGGER.debug("[%s] MQTT disconnected cleanly", self._sn)
 
     def _on_mqtt_message(self, client: Any, userdata: Any, msg: Any) -> None:
+        _LOGGER.debug(
+            "[%s] Received %d bytes on topic %s qos=%s",
+            self._sn, len(msg.payload), msg.topic, msg.qos,
+        )
         try:
             parsed = self._parse_payload(msg.payload)
             if parsed is not None:
                 # Deliver to coordinator on the HA event loop thread
                 self._loop.call_soon_threadsafe(self._on_message, self._sn, parsed)
+            else:
+                _LOGGER.debug("[%s] Payload could not be parsed: %s", self._sn, msg.payload.hex())
         except Exception as err:
             _LOGGER.debug("[%s] Failed to parse MQTT message on %s: %s", self._sn, msg.topic, err)
 
