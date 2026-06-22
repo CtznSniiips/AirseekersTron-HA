@@ -10,6 +10,7 @@ import aiohttp
 
 from .const import (
     API_BASE_EU,
+    API_BASE_EU_CLOUD,
     API_DEVICE_IOT_CERT,
     API_DEVICE_LIST,
     API_FIRMWARE_LATEST,
@@ -111,11 +112,50 @@ class AirseekersAPI:
         """Fetch MQTT IoT certificate for a device.
 
         Returns dict with: mqtt_broker, mqtt_client_id, iot_certificate,
-        iot_cert_token, cert_key, private_key
+        iot_cert_token, cert_key, private_key.
+
+        Static analysis of libapp.so confirms the request is a POST with body
+        {"sn": "<device_sn>"}. Falls back to the cloud-eu host if the primary
+        base URL returns 404, since routing differs between eu and cloud-eu.
         """
-        params = {"sn": device_sn}
-        data = await self._request("GET", API_DEVICE_IOT_CERT, params=params)
-        return _unwrap_data(data)
+        payload = {"sn": device_sn}
+        try:
+            data = await self._request("POST", API_DEVICE_IOT_CERT, json=payload)
+            result = _unwrap_data(data)
+            if result:
+                return result
+        except AirseekersAPIError as err:
+            if "404" not in str(err):
+                raise
+            _LOGGER.debug(
+                "POST %s returned 404 on primary host; trying cloud-eu base URL",
+                API_DEVICE_IOT_CERT,
+            )
+
+        # Retry on the cloud-eu host if primary returned 404
+        alt_base = API_BASE_EU_CLOUD
+        if self._base_url.rstrip("/") == alt_base.rstrip("/"):
+            raise AirseekersAPIError(
+                f"iot-cert 404 on both hosts for sn={device_sn}"
+            )
+
+        _LOGGER.info("Retrying iot-cert on %s", alt_base)
+        alt_url = alt_base.rstrip("/") + API_DEVICE_IOT_CERT
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._access_token}",
+        }
+        async with self._session.post(
+            alt_url, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                raise AirseekersAPIError(
+                    f"iot-cert alt host HTTP {resp.status}: {body[:200]}"
+                )
+            body = await resp.json(content_type=None)
+            return _unwrap_data(body)
 
     async def async_get_server_host(self) -> dict[str, Any]:
         """Get the regional server host (for region selection)."""

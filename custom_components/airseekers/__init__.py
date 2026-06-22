@@ -37,9 +37,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await api.async_login()
         devices = await api.async_get_devices()
+        # API returns "sn" key (not "device_sn") per static analysis of libapp.so
         device_info = next(
-            (d for d in devices if d.get("device_sn") == sn or d.get("sn") == sn),
-            {"device_sn": sn},
+            (d for d in devices if d.get("sn") == sn or d.get("device_sn") == sn or d.get("deviceSn") == sn),
+            {"sn": sn},
         )
     except Exception as err:
         _LOGGER.error("Airseekers failed to fetch device info for %s: %s", sn, err)

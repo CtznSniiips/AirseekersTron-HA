@@ -35,7 +35,8 @@ class AirseekersDeviceData:
 
     def __init__(self, device_info: dict[str, Any]) -> None:
         self.device_info = device_info
-        self.sn: str = device_info.get("device_sn", device_info.get("sn", ""))
+        # API returns "sn" (not "device_sn") based on static analysis of libapp.so
+        self.sn: str = device_info.get("sn") or device_info.get("device_sn") or device_info.get("deviceSn", "")
 
         # REST-sourced
         self.maps: list[dict] = []
@@ -201,7 +202,13 @@ class AirseekersCoordinator(DataUpdateCoordinator):
         sn = self.device.sn
         try:
             cert_info = await self.api.async_get_iot_cert(sn)
-            _LOGGER.debug("[%s] Got IoT cert: broker=%s", sn, cert_info.get("mqtt_broker"))
+            _LOGGER.debug(
+                "[%s] Got IoT cert: broker=%s client_id=%s has_cert=%s",
+                sn,
+                cert_info.get("mqtt_broker"),
+                cert_info.get("mqtt_client_id"),
+                bool(cert_info.get("iot_certificate") or cert_info.get("cert_key")),
+            )
         except Exception as err:
             _LOGGER.warning("[%s] Could not fetch IoT cert: %s — MQTT unavailable", sn, err)
             return

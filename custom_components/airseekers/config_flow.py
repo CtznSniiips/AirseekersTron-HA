@@ -93,17 +93,19 @@ class AirseekersConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Select which device to integrate."""
         errors: dict[str, str] = {}
 
+        def _sn(d: dict) -> str:
+            return d.get("sn") or d.get("device_sn") or d.get("deviceSn", "")
+
         device_options = {
-            d.get("device_sn", d.get("sn", "")): (
-                f"{d.get('model', 'Airseekers Tron')} — {d.get('device_sn', d.get('sn', ''))}"
-            )
+            _sn(d): f"{d.get('model', 'Airseekers Tron')} — {_sn(d)}"
             for d in self._devices
+            if _sn(d)
         }
 
         if user_input is not None:
             sn = user_input[CONF_DEVICE_SN]
             device = next(
-                (d for d in self._devices if d.get("device_sn") == sn or d.get("sn") == sn),
+                (d for d in self._devices if (d.get("sn") or d.get("device_sn") or d.get("deviceSn")) == sn),
                 None,
             )
             if device:
@@ -118,7 +120,7 @@ class AirseekersConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _create_entry(self, device: dict) -> FlowResult:
         """Create the config entry for a device."""
-        sn = device.get("device_sn") or device.get("sn", "")
+        sn = device.get("sn") or device.get("device_sn") or device.get("deviceSn", "")
         await self.async_set_unique_id(sn)
         self._abort_if_unique_id_configured()
 
