@@ -65,10 +65,22 @@ class AirseekersAPI:
             "password": self._password,
         }
         data = await self._request("POST", API_LOGIN, json=payload, auth=False)
-        self._access_token = data.get("access_token") or data.get("data", {}).get("access_token")
-        self._refresh_token = data.get("refresh_token") or data.get("data", {}).get("refresh_token")
-        expires_in = data.get("expires_in") or data.get("data", {}).get("expires_in", 3600)
+        inner = data.get("data", data)
+        self._access_token  = inner.get("access_token")
+        self._refresh_token = inner.get("refresh_token")
+        expires_in = inner.get("expires_in", 3600)
         self._token_expires_at = time.monotonic() + int(expires_in)
+
+        # The login response includes the regional API host to use for all
+        # subsequent calls. Switch to it immediately.
+        host = inner.get("host", "").rstrip("/")
+        if host and host != self._base_url:
+            _LOGGER.debug(
+                "Airseekers: switching API base from %s to %s (from login response)",
+                self._base_url, host,
+            )
+            self._base_url = host
+
         _LOGGER.debug("Airseekers login successful; token expires in %s s", expires_in)
         return data
 
