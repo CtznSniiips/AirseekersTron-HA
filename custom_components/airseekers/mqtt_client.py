@@ -277,12 +277,16 @@ class AirseekersDeviceMQTT:
                 self._sn, self._cert_info.get("mqtt_client_id", ""),
             )
             self._connected = True
-            # Subscribe to /down (mower status) instead of /up (which triggers takeover)
-            # Also subscribe to wildcard to catch any direction
+            # Subscribe to wildcard to observe ALL topics on this device prefix.
+            # Also subscribe to specific /up and /down to cover both directions.
+            # With client_id = SN_ha (not cloud client_id), we may coexist
+            # without displacing the cloud backend.
+            client.subscribe(self._topic_wildcard, qos=MQTT_QOS_STATUS)
+            _LOGGER.debug("[%s] Subscribed wildcard %s", self._sn, self._topic_wildcard)
+            client.subscribe(self._topic_up, qos=MQTT_QOS_STATUS)
+            _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_up)
             client.subscribe(self._topic_down, qos=MQTT_QOS_STATUS)
             _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_down)
-            client.subscribe(self._topic_wildcard, qos=MQTT_QOS_STATUS)
-            _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_wildcard)
         else:
             _LOGGER.error("[%s] MQTT connect refused rc=%s: %s", self._sn, rc, _rc_description(rc))
             self._connected = False
