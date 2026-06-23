@@ -206,7 +206,10 @@ class AirseekersCoordinator(DataUpdateCoordinator):
                 if record.get("task_id"):
                     _LOGGER.debug("[%s] Latest task record: %s", sn, record)
             if isinstance(results[4], list) and results[4]:
-                _LOGGER.debug("[%s] Notifications: %s", sn, results[4][:3])
+                notifications = results[4]
+                _LOGGER.debug("[%s] Notifications: %s", sn, notifications[:3])
+                # Update device state from most recent notification
+                self._infer_state_from_notifications(notifications)
 
             for result, name in zip(results, ["maps", "tasks", "firmware", "task_record", "notify"]):
                 if isinstance(result, Exception):
@@ -254,13 +257,7 @@ class AirseekersCoordinator(DataUpdateCoordinator):
                 sorted(cert_info.keys()),
                 bool(cert_info.get("iot_cert_token")),
             )
-            # Log full cert for SSH key extraction attempt (remove after SSH access confirmed)
-            _LOGGER.debug("[%s] IoT cert full (for SSH key test):\n%s",
-                          sn, {k: v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v
-                               for k, v in cert_info.items()})
-            pk = cert_info.get("private_key", "")
-            if pk:
-                _LOGGER.debug("[%s] PRIVATE KEY for SSH attempt:\n%s", sn, pk)
+
         except Exception as err:
             _LOGGER.warning("[%s] Could not fetch IoT cert: %s — MQTT unavailable", sn, err)
             return
@@ -278,6 +275,49 @@ class AirseekersCoordinator(DataUpdateCoordinator):
             _LOGGER.info("[%s] MQTT connected", sn)
         else:
             _LOGGER.warning("[%s] MQTT connection failed", sn)
+
+    def _infer_state_from_notifications(self, notifications: list) -> None:
+        """
+        Infer current device state from notification history.
+        Used as fallback when MQTT is unavailable.
+        Maps notify_type codes to task states.
+        """
+        if not notifications:
+            return
+
+        # Sort by created_at descending to get most recent first
+        sorted_notifs = sorted(notifications, key=lambda n: n.get("created_at", 0), reverse=True)
+        most_recent = sorted_notifs[0]
+        notify_type = most_recent.get("notify_type", 0)
+        content = most_recent.get("content", "")
+
+        from .const import (
+            TASK_STATE_IDLE, TASK_STATE_MOWING, TASK_STATE_CHARGING, TASK_STATE_ERROR
+        )
+        from .proto import TaskStatusRsp
+
+        # Map notify_type → task state
+        # Confirmed from actual API responses:
+        # 900013 = 充电完成 = Charging complete
+        # 900102 = 任务完成 = Task completed
+        NOTIFY_STATE_MAP = {
+            900013: TASK_STATE_CHARGING,  # Charging complete → docked/charged
+            900102: TASK_STATE_IDLE,       # Task completed → idle/docked
+            900017: TASK_STATE_MOWING,     # Area mowing (started)
+            900023: TASK_STATE_ERROR,      # Map/RTK error
+            800002: TASK_STATE_IDLE,       # Low battery warning → returning
+        }
+
+        inferred_state = NOTIFY_STATE_MAP.get(notify_type)
+        if inferred_state is not None and self.device.task_status is None:
+            # Only use notification state if we have no MQTT state
+            fake_status = TaskStatusRsp()
+            fake_status.state = inferred_state
+            self.device.task_status = fake_status
+            _LOGGER.debug(
+                "[%s] State inferred from notification type=%s: %s — %s",
+                self.device.sn, notify_type, fake_status.state_str, content,
+            )
 
     def _on_mqtt_disconnect(self, sn: str, rc: int) -> None:
         """

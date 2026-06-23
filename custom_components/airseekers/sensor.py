@@ -32,6 +32,16 @@ class AirseekerseSensorDescription(SensorEntityDescription):
 
 SENSOR_DESCRIPTIONS: tuple[AirseekerseSensorDescription, ...] = (
     AirseekerseSensorDescription(
+        key="last_notification",
+        name="Last Notification",
+        value_fn=lambda d: (
+            d.device_info.get("_last_notification_content", "")
+            if d.device_info else ""
+        ),
+        icon="mdi:bell-outline",
+        entity_registry_enabled_default=False,
+    ),
+    AirseekerseSensorDescription(
         key="battery",
         name="Battery",
         device_class=SensorDeviceClass.BATTERY,
