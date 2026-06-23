@@ -196,7 +196,11 @@ class AirseekersDeviceMQTT:
     def _connect_sync(self) -> bool:
         cert        = self._cert_info
         broker_raw  = cert.get("mqtt_broker", "")
-        client_id   = cert.get("mqtt_client_id", f"ha_{self._sn}")
+        # Use SN-based client_id to avoid displacing the cloud backend.
+        # The cloud backend connects as mqtt_client_id (mdrnvpgjlzqyigkk).
+        # Using a different client_id lets us attempt coexistence.
+        cloud_client_id = cert.get("mqtt_client_id", "")
+        client_id = f"{self._sn}_ha"
         ca_cert     = cert.get("ca", "")
         client_cert = cert.get("cert_key", "") or cert.get("iot_certificate", "")
         private_key = cert.get("private_key", "")
@@ -207,9 +211,9 @@ class AirseekersDeviceMQTT:
 
         host, port = self._parse_broker(broker_raw)
         _LOGGER.info(
-            "[%s] Connecting AWS IoT Core (mTLS) %s:%s client_id=%s "
-            "ca=%s cert=%s key=%s",
-            self._sn, host, port, client_id,
+            "[%s] Connecting AWS IoT Core (mTLS) %s:%s "
+            "client_id=%s (cloud=%s) ca=%s cert=%s key=%s",
+            self._sn, host, port, client_id, cloud_client_id,
             bool(ca_cert), bool(client_cert), bool(private_key),
         )
 

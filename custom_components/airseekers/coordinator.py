@@ -161,13 +161,34 @@ class AirseekersCoordinator(DataUpdateCoordinator):
         """Fetch REST data. Called on schedule and on first refresh."""
         sn = self.device.sn
         try:
+            # Fetch device list separately so we can log the FULL response
+            devices = await self.api.async_get_devices()
+            if devices:
+                device_info = next(
+                    (d for d in devices if d.get("sn") == sn or d.get("device_sn") == sn),
+                    None,
+                )
+                if device_info:
+                    self.device.device_info = device_info
+                    # Log ALL fields — helps discover undocumented status fields
+                    _LOGGER.debug(
+                        "[%s] Full device REST response: %s",
+                        sn, device_info,
+                    )
+                    # Update online status from REST
+                    online = device_info.get("online_status", 0) == 1
+                    if self.device.online != online:
+                        self.device.online = online
+                        _LOGGER.info("[%s] Online status from REST: %s", sn, online)
+
             maps_task   = asyncio.create_task(self.api.async_get_maps(sn))
             tasks_task  = asyncio.create_task(self.api.async_get_tasks(sn))
             fw_task     = asyncio.create_task(self.api.async_get_firmware_info(sn))
             record_task = asyncio.create_task(self.api.async_get_latest_task_record(sn))
+            notify_task = asyncio.create_task(self.api.async_get_notifications(sn))
 
             results = await asyncio.gather(
-                maps_task, tasks_task, fw_task, record_task,
+                maps_task, tasks_task, fw_task, record_task, notify_task,
                 return_exceptions=True,
             )
 
@@ -175,14 +196,20 @@ class AirseekersCoordinator(DataUpdateCoordinator):
                 self.device.maps = results[0]
             if isinstance(results[1], list):
                 self.device.tasks = results[1]
+                if results[1]:
+                    _LOGGER.debug("[%s] Tasks: %s", sn, results[1])
             if isinstance(results[2], dict):
                 self.device.firmware_info = results[2]
             if isinstance(results[3], dict):
-                self.device.latest_task_record = results[3]
+                record = results[3]
+                self.device.latest_task_record = record
+                if record.get("task_id"):
+                    _LOGGER.debug("[%s] Latest task record: %s", sn, record)
+            if isinstance(results[4], list) and results[4]:
+                _LOGGER.debug("[%s] Notifications: %s", sn, results[4][:3])
 
-            for result, name in zip(results, ["maps", "tasks", "firmware", "task_record"]):
+            for result, name in zip(results, ["maps", "tasks", "firmware", "task_record", "notify"]):
                 if isinstance(result, Exception):
-                    # 407 = "already latest version" — not a real error
                     msg = str(result)
                     if "407" not in msg:
                         _LOGGER.warning("[%s] REST %s fetch failed: %s", sn, name, result)

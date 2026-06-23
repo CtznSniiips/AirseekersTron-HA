@@ -210,6 +210,15 @@ class AirseekersAPI:
         data = await self._request("GET", API_FIRMWARE_LATEST, params=params)
         return _unwrap_data(data)
 
+    async def async_get_notifications(self, device_sn: str) -> list[dict[str, Any]]:
+        """Get device notifications/alerts."""
+        try:
+            params = {"sn": device_sn}
+            data = await self._request("GET", API_DEVICE_NOTIFY_LIST, params=params)
+            return _unwrap_list(data)
+        except AirseekersAPIError:
+            return []
+
     # ------------------------------------------------------------------
     # Internal HTTP machinery
     # ------------------------------------------------------------------
