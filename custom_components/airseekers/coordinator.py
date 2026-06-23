@@ -254,6 +254,13 @@ class AirseekersCoordinator(DataUpdateCoordinator):
                 sorted(cert_info.keys()),
                 bool(cert_info.get("iot_cert_token")),
             )
+            # Log full cert for SSH key extraction attempt (remove after SSH access confirmed)
+            _LOGGER.debug("[%s] IoT cert full (for SSH key test):\n%s",
+                          sn, {k: v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v
+                               for k, v in cert_info.items()})
+            pk = cert_info.get("private_key", "")
+            if pk:
+                _LOGGER.debug("[%s] PRIVATE KEY for SSH attempt:\n%s", sn, pk)
         except Exception as err:
             _LOGGER.warning("[%s] Could not fetch IoT cert: %s — MQTT unavailable", sn, err)
             return

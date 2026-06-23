@@ -21,6 +21,7 @@ from .const import (
     API_TASK_LIST,
     API_TASK_RECORD_LATEST,
     TOKEN_REFRESH_MARGIN,
+    API_DEVICE_NOTIFY_LIST,
 )
 
 _LOGGER = logging.getLogger(__name__)
