@@ -217,12 +217,15 @@ class AirseekersCoordinator(DataUpdateCoordinator):
 
         try:
             cert_info = await self.api.async_get_iot_cert(sn)
+            # Log all keys so we can see exactly what the iot-cert response contains
             _LOGGER.debug(
-                "[%s] Got IoT cert: broker=%s client_id=%s has_cert=%s",
+                "[%s] Got IoT cert: broker=%s client_id=%s "
+                "keys=%s has_token=%s",
                 sn,
                 cert_info.get("mqtt_broker"),
                 cert_info.get("mqtt_client_id"),
-                bool(cert_info.get("ca") or cert_info.get("iot_certificate") or cert_info.get("cert_key")),
+                sorted(cert_info.keys()),
+                bool(cert_info.get("iot_cert_token")),
             )
         except Exception as err:
             _LOGGER.warning("[%s] Could not fetch IoT cert: %s — MQTT unavailable", sn, err)

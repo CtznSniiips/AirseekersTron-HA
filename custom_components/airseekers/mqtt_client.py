@@ -1,16 +1,29 @@
 """
-Airseekers MQTT client — AWS IoT Core via mTLS.
+Airseekers MQTT client — connects as the APP does, not as the mower.
 
-Design: this class manages a SINGLE connection lifetime. It does NOT reconnect.
-Reconnection (with fresh credentials) is the coordinator's responsibility.
-The coordinator fetches a new unique mqtt_client_id from the API each time,
-avoiding session-takeover conflicts with the mobile app.
+Architecture (confirmed by static analysis of libapp.so):
 
-Broker:  AWS IoT Core
-Auth:    mTLS — cert_key (client cert) + private_key, ca (Amazon Root CA)
-Topics:
-  Subscribe: as/{sn}/up    device → cloud (status, responses)
-  Publish:   as/{sn}/down  cloud → device (commands)
+MOWER → AWS IoT Core:
+  port:      8883 (raw MQTT over TLS, mTLS client cert)
+  client_id: embedded in firmware (provisioned at binding time)
+  auth:      TLS client certificate (cert_key + private_key from iot-cert)
+  publishes: as/{sn}/up   (status to cloud)
+  subscribes: as/{sn}/down (commands from cloud)
+
+APP → AWS IoT Core:
+  port:      443 (MQTT over WebSocket)
+  client_id: mqtt_client_id from iot-cert response
+  auth:      JWT token — username='JWTKey', password=iot_cert_token
+  subscribes: as/{sn}/up  (receive mower status)
+  publishes:  as/{sn}/down (send commands)
+
+Key evidence:
+  - 'MqttServerWsConnection' found in APK (WebSocket MQTT class)
+  - 'JWTKey' found adjacent to mqtt_client.dart (custom authorizer name)
+  - 'iot_cert_token' is the JWT password field
+  - Port 443 appears near MqttServerWsConnection
+  - The mower's 5-min keepalive causes RC=7 when we use mTLS (same identity)
+  - WebSocket + JWT uses a different AWS IoT connection path → no conflict
 """
 from __future__ import annotations
 
@@ -23,7 +36,6 @@ from typing import Any
 from collections.abc import Callable
 
 from .const import (
-    MQTT_DEFAULT_PORT,
     MQTT_KEEPALIVE,
     MQTT_QOS_CMD,
     MQTT_QOS_STATUS,
@@ -57,6 +69,13 @@ from .proto import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# AWS IoT custom authorizer name — found as string constant 'JWTKey' in libapp.so
+# adjacent to mqtt_client/src/mqtt_server_client.dart
+AUTHORIZER_NAME = "JWTKey"
+
+# App connects on WebSocket port 443, NOT raw MQTT port 8883
+MQTT_APP_PORT = 443
+
 try:
     import paho.mqtt.client as mqtt
     try:
@@ -72,14 +91,15 @@ except ImportError:
     _PAHO_V2 = False
     _LOGGER.warning("paho-mqtt not installed; MQTT unavailable")
 
-MessageCallback    = Callable[[str, Any], None]   # (sn, parsed_message)
-DisconnectCallback = Callable[[str, int], None]   # (sn, rc)
+MessageCallback    = Callable[[str, Any], None]
+DisconnectCallback = Callable[[str, int], None]
 
 
 class AirseekersDeviceMQTT:
     """
-    Single-lifetime MQTT connection for one Airseekers device.
-    Does NOT reconnect internally. Coordinator handles reconnection with fresh creds.
+    MQTT connection for one Airseekers device.
+    Connects as the mobile app does: WebSocket on port 443, JWT auth.
+    Single-lifetime — coordinator handles reconnection.
     """
 
     def __init__(
@@ -113,14 +133,13 @@ class AirseekersDeviceMQTT:
         return self._connected
 
     async def async_connect(self) -> bool:
-        """Connect once. Returns True on successful TCP+TLS handshake."""
+        """Connect once via WebSocket + JWT. Returns True on success."""
         if not HAS_PAHO:
             _LOGGER.error("paho-mqtt not installed")
             return False
         return await self._loop.run_in_executor(None, self._connect_sync)
 
     async def async_disconnect(self) -> None:
-        """Disconnect and clean up. Safe to call multiple times."""
         self._shutdown = True
         if self._client:
             try:
@@ -131,7 +150,7 @@ class AirseekersDeviceMQTT:
                 pass
             self._client = None
         self._connected = False
-        self._cleanup_certs()
+        await self._loop.run_in_executor(None, self._cleanup_certs)
 
     # ------------------------------------------------------------------
     # Commands
@@ -160,48 +179,61 @@ class AirseekersDeviceMQTT:
         cert         = self._cert_info
         broker_raw   = cert.get("mqtt_broker", "")
         client_id    = cert.get("mqtt_client_id", f"ha_{self._sn}")
+        jwt_token    = cert.get("iot_cert_token", "")
         ca_cert      = cert.get("ca", "")
-        client_cert  = cert.get("cert_key", "") or cert.get("iot_certificate", "")
-        private_key  = cert.get("private_key", "")
 
         if not broker_raw:
             _LOGGER.error("[%s] No mqtt_broker in iot-cert response", self._sn)
             return False
 
-        host, port = self._parse_broker(broker_raw)
+        host = self._parse_host(broker_raw)
+
         _LOGGER.info(
-            "[%s] Connecting AWS IoT Core %s:%s client_id=%s ca=%s cert=%s key=%s",
-            self._sn, host, port, client_id,
-            bool(ca_cert), bool(client_cert), bool(private_key),
+            "[%s] Connecting AWS IoT Core (WebSocket/JWT) %s:%s "
+            "client_id=%s token=%s ca=%s",
+            self._sn, host, MQTT_APP_PORT, client_id,
+            bool(jwt_token), bool(ca_cert),
         )
+
+        if not jwt_token:
+            _LOGGER.warning(
+                "[%s] No iot_cert_token in response — JWT auth will fail. "
+                "Full response keys: %s",
+                self._sn, list(cert.keys()),
+            )
 
         client = self._make_client(client_id)
         client.on_connect    = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_message    = self._on_mqtt_message
 
+        # JWT auth: username = authorizer name, password = JWT token
+        # AWS IoT custom authorizer 'JWTKey' validates the iot_cert_token
+        client.username_pw_set(
+            username=AUTHORIZER_NAME,
+            password=jwt_token,
+        )
+        _LOGGER.debug(
+            "[%s] JWT auth: username=%s password_len=%s",
+            self._sn, AUTHORIZER_NAME, len(jwt_token),
+        )
+
+        # TLS for the WebSocket connection — server-side only (no client cert)
         try:
             ssl_ctx = ssl.create_default_context()
             if ca_cert:
                 ca_path = self._write_temp("ca.crt", self._ensure_pem(ca_cert))
                 if ca_path:
                     ssl_ctx.load_verify_locations(ca_path)
-                    _LOGGER.debug("[%s] Loaded Amazon Root CA", self._sn)
-            if client_cert and private_key:
-                crt_path = self._write_temp("client.crt", self._ensure_pem(client_cert))
-                key_path = self._write_temp("client.key", self._ensure_pem(private_key, is_key=True))
-                if crt_path and key_path:
-                    ssl_ctx.load_cert_chain(crt_path, key_path)
-                    _LOGGER.debug("[%s] Loaded mTLS client cert + key", self._sn)
-            else:
-                _LOGGER.warning("[%s] Missing client cert or private key", self._sn)
+                    _LOGGER.debug("[%s] Loaded Amazon Root CA for server verification", self._sn)
+            # No client cert for WebSocket/JWT auth
             client.tls_set_context(ssl_ctx)
         except Exception as err:
             _LOGGER.error("[%s] TLS setup failed: %s", self._sn, err)
             return False
 
         try:
-            client.connect(host, port, keepalive=MQTT_KEEPALIVE)
+            client.connect(host, MQTT_APP_PORT, keepalive=MQTT_KEEPALIVE)
         except Exception as err:
             _LOGGER.error("[%s] connect() failed: %s", self._sn, err)
             return False
@@ -211,35 +243,41 @@ class AirseekersDeviceMQTT:
         return True
 
     def _make_client(self, client_id: str) -> Any:
-        if _PAHO_V2:
-            return mqtt.Client(
-                callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
-                client_id=client_id,
-                clean_session=True,
-                protocol=mqtt.MQTTv311,
-                reconnect_on_failure=False,  # coordinator handles reconnect
-            )
-        return mqtt.Client(
+        """Create paho client with WebSocket transport."""
+        kwargs = dict(
             client_id=client_id,
             clean_session=True,
             protocol=mqtt.MQTTv311,
+            transport="websockets",
         )
+        if _PAHO_V2:
+            return mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+                reconnect_on_failure=False,
+                **kwargs,
+            )
+        return mqtt.Client(**kwargs)
 
     # ------------------------------------------------------------------
-    # Paho callbacks
+    # Callbacks
     # ------------------------------------------------------------------
 
     def _on_connect(self, client: Any, userdata: Any, flags: Any, rc: int) -> None:
         if rc == 0:
-            _LOGGER.info("[%s] MQTT connected (client_id=%s)",
-                         self._sn, self._cert_info.get("mqtt_client_id", ""))
+            _LOGGER.info(
+                "[%s] MQTT connected via WebSocket+JWT (client_id=%s)",
+                self._sn, self._cert_info.get("mqtt_client_id", ""),
+            )
             self._connected = True
             client.subscribe(self._topic_up, qos=MQTT_QOS_STATUS)
             _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_up)
         else:
-            _LOGGER.error("[%s] Connect refused rc=%s: %s", self._sn, rc, _rc_description(rc))
+            _LOGGER.error(
+                "[%s] Connect refused rc=%s: %s — "
+                "check iot_cert_token is populated and JWTKey authorizer is valid",
+                self._sn, rc, _rc_description(rc),
+            )
             self._connected = False
-            # Notify coordinator so it can try fresh credentials
             self._loop.call_soon_threadsafe(self._on_disconnect_cb, self._sn, rc)
 
     def _on_disconnect(self, client: Any, userdata: Any, rc: int) -> None:
@@ -250,7 +288,6 @@ class AirseekersDeviceMQTT:
         if rc != 0:
             _LOGGER.warning("[%s] Disconnected rc=%s: %s", self._sn, rc, _rc_description(rc))
             if prev:
-                # Notify coordinator to reconnect with fresh credentials
                 self._loop.call_soon_threadsafe(self._on_disconnect_cb, self._sn, rc)
         else:
             _LOGGER.debug("[%s] Disconnected cleanly", self._sn)
@@ -327,18 +364,13 @@ class AirseekersDeviceMQTT:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_broker(broker: str) -> tuple[str, int]:
-        for scheme in ("ssl://", "tls://", "mqtts://", "mqtt://", "tcp://"):
+    def _parse_host(broker: str) -> str:
+        """Strip scheme and port, return hostname only."""
+        for scheme in ("ssl://", "tls://", "mqtts://", "mqtt://", "tcp://", "wss://", "ws://"):
             if broker.startswith(scheme):
                 broker = broker[len(scheme):]
                 break
-        if ":" in broker:
-            parts = broker.rsplit(":", 1)
-            try:
-                return parts[0], int(parts[1])
-            except ValueError:
-                pass
-        return broker, MQTT_DEFAULT_PORT
+        return broker.split(":")[0]
 
     def _write_temp(self, filename: str, content: str) -> str | None:
         if not content:
@@ -364,10 +396,12 @@ class AirseekersDeviceMQTT:
         return f"-----BEGIN {label}-----\n" + "\n".join(chunks) + f"\n-----END {label}-----\n"
 
     def _cleanup_certs(self) -> None:
+        """Remove temp cert files. Must run in executor (does blocking I/O)."""
         if self._temp_cert_dir:
             import shutil
-            shutil.rmtree(self._temp_cert_dir, ignore_errors=True)
+            d = self._temp_cert_dir
             self._temp_cert_dir = None
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def _rc_description(rc: int) -> str:
@@ -376,8 +410,8 @@ def _rc_description(rc: int) -> str:
         1: "incorrect protocol version",
         2: "client identifier rejected",
         3: "server unavailable",
-        4: "bad username or password",
-        5: "not authorised",
-        7: "connection lost / session takeover by another client",
+        4: "bad username or password — JWT token may be invalid or expired",
+        5: "not authorised — IoT policy may not allow this client_id",
+        7: "connection lost",
         8: "keepalive timeout",
     }.get(rc, f"unknown rc={rc}")
