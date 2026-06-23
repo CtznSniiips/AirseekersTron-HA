@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -147,6 +148,7 @@ class AirseekersCoordinator(DataUpdateCoordinator):
         self.api = api
         self.device = AirseekersDeviceData(device_info)
         self._mqtt_reconnect_task: asyncio.Task | None = None
+        self._takeover_times: list[float] = []  # timestamps of recent rc=7 disconnects
 
         super().__init__(
             hass,
@@ -242,35 +244,56 @@ class AirseekersCoordinator(DataUpdateCoordinator):
 
     def _on_mqtt_disconnect(self, sn: str, rc: int) -> None:
         """
-        Called when MQTT disconnects. Schedule a reconnect with fresh credentials.
-        RC=7 (session takeover by mobile app) is expected — fresh creds fix it.
+        Called when MQTT disconnects.
+
+        Now that we connect as the app (WebSocket+JWT on port 443) rather than
+        as the mower (mTLS on port 8883), we should no longer get RC=7 session
+        takeovers from the mower's keepalive cycle. Any disconnect is unexpected
+        and warrants a reconnect with backoff.
         """
-        if rc != 0:
+        if rc == 0:
+            _LOGGER.debug("[%s] MQTT disconnected cleanly", sn)
+            return
+
+        now = time.monotonic()
+        self._takeover_times = [t for t in self._takeover_times if now - t < 60]
+        self._takeover_times.append(now)
+        rapid = len(self._takeover_times) >= 3
+
+        if rapid:
+            initial_delay = 60
+            _LOGGER.warning(
+                "[%s] Rapid MQTT disconnects (rc=%s, %sx in 60s) — backing off %ss",
+                sn, rc, len(self._takeover_times), initial_delay,
+            )
+        else:
+            initial_delay = 10
             _LOGGER.info(
-                "[%s] MQTT disconnected (rc=%s) — will reconnect with fresh credentials in 10s",
-                sn, rc,
+                "[%s] MQTT disconnected (rc=%s) — reconnecting in %ss",
+                sn, rc, initial_delay,
             )
 
-            def _schedule() -> None:
-                if self._mqtt_reconnect_task and not self._mqtt_reconnect_task.done():
-                    return
-                self._mqtt_reconnect_task = self.hass.loop.create_task(
-                    self._async_reconnect_with_backoff()
-                )
+        def _schedule(delay: int = initial_delay) -> None:
+            if self._mqtt_reconnect_task and not self._mqtt_reconnect_task.done():
+                return
+            self._mqtt_reconnect_task = self.hass.loop.create_task(
+                self._async_reconnect_with_backoff(initial_delay=delay)
+            )
 
-            self.hass.loop.call_soon_threadsafe(_schedule)
+        self.hass.loop.call_soon_threadsafe(_schedule)
 
-    async def _async_reconnect_with_backoff(self) -> None:
-        """Reconnect with fresh IoT credentials, with exponential backoff."""
-        delay = 10
+    async def _async_reconnect_with_backoff(self, initial_delay: int = 10) -> None:
+        """Reconnect with exponential backoff, up to 5 minutes."""
+        delay = initial_delay
         while True:
             await asyncio.sleep(delay)
             if self.device.mqtt and self.device.mqtt.connected:
                 return
-            _LOGGER.debug("[%s] Attempting MQTT reconnect with fresh credentials", self.device.sn)
+            _LOGGER.debug("[%s] Attempting MQTT reconnect", self.device.sn)
             try:
                 await self._async_connect_mqtt()
                 if self.device.mqtt and self.device.mqtt.connected:
+                    _LOGGER.info("[%s] MQTT reconnected successfully", self.device.sn)
                     return
             except Exception as err:
                 _LOGGER.warning("[%s] MQTT reconnect failed: %s", self.device.sn, err)
