@@ -12,9 +12,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import AirseekersAPI, AirseekersAPIError, AirseekersAuthError
 from .const import (
     DOMAIN,
-    POLL_INTERVAL_FAST,
     POLL_INTERVAL_SLOW,
-    TASK_STATE_MAP,
 )
 from .mqtt_client import AirseekersDeviceMQTT
 from .proto import (
@@ -35,7 +33,7 @@ class AirseekersDeviceData:
 
     def __init__(self, device_info: dict[str, Any]) -> None:
         self.device_info = device_info
-        # API returns "sn" (not "device_sn") based on static analysis of libapp.so
+        # API returns "sn" key (not "device_sn") per static analysis of libapp.so
         self.sn: str = device_info.get("sn") or device_info.get("device_sn") or device_info.get("deviceSn", "")
 
         # REST-sourced
@@ -132,9 +130,12 @@ class AirseekersCoordinator(DataUpdateCoordinator):
     """
     Coordinator for one Airseekers device.
 
-    - Polls REST API every POLL_INTERVAL_SLOW for device/map/task/firmware info.
-    - MQTT push updates arrive immediately via _on_mqtt_message callback.
-    - Entities subscribe to coordinator updates via async_add_listener.
+    REST polls every POLL_INTERVAL_SLOW seconds.
+    MQTT push updates arrive via _on_mqtt_message callback.
+
+    Key design: fresh IoT credentials are fetched on every MQTT reconnect.
+    The /api/web/device/iot-cert endpoint issues a new unique mqtt_client_id
+    each call, preventing session-takeover conflicts with the mobile app.
     """
 
     def __init__(
@@ -145,7 +146,7 @@ class AirseekersCoordinator(DataUpdateCoordinator):
     ) -> None:
         self.api = api
         self.device = AirseekersDeviceData(device_info)
-        self._mqtt_setup_done = False
+        self._mqtt_reconnect_task: asyncio.Task | None = None
 
         super().__init__(
             hass,
@@ -155,25 +156,18 @@ class AirseekersCoordinator(DataUpdateCoordinator):
         )
 
     async def _async_update_data(self) -> AirseekersDeviceData:
-        """Fetch data from REST API. Called by coordinator on schedule."""
+        """Fetch REST data. Called on schedule and on first refresh."""
         sn = self.device.sn
         try:
-            # Parallel REST calls
-            maps_task    = asyncio.create_task(self.api.async_get_maps(sn))
-            tasks_task   = asyncio.create_task(self.api.async_get_tasks(sn))
-            fw_task      = asyncio.create_task(self.api.async_get_firmware_info(sn))
-            record_task  = asyncio.create_task(self.api.async_get_latest_task_record(sn))
+            maps_task   = asyncio.create_task(self.api.async_get_maps(sn))
+            tasks_task  = asyncio.create_task(self.api.async_get_tasks(sn))
+            fw_task     = asyncio.create_task(self.api.async_get_firmware_info(sn))
+            record_task = asyncio.create_task(self.api.async_get_latest_task_record(sn))
 
             results = await asyncio.gather(
                 maps_task, tasks_task, fw_task, record_task,
-                return_exceptions=True
+                return_exceptions=True,
             )
-
-            for result, name in zip(results, ["maps", "tasks", "firmware", "task_record"]):
-                if isinstance(result, Exception):
-                    _LOGGER.warning("[%s] REST %s fetch failed: %s", sn, name, result)
-                elif isinstance(result, list):
-                    setattr(self.device, name + ("" if name != "task_record" else ""), result)
 
             if isinstance(results[0], list):
                 self.device.maps = results[0]
@@ -184,22 +178,41 @@ class AirseekersCoordinator(DataUpdateCoordinator):
             if isinstance(results[3], dict):
                 self.device.latest_task_record = results[3]
 
+            for result, name in zip(results, ["maps", "tasks", "firmware", "task_record"]):
+                if isinstance(result, Exception):
+                    # 407 = "already latest version" — not a real error
+                    msg = str(result)
+                    if "407" not in msg:
+                        _LOGGER.warning("[%s] REST %s fetch failed: %s", sn, name, result)
+
         except (AirseekersAuthError, AirseekersAPIError) as err:
             raise UpdateFailed(f"Airseekers API error for {sn}: {err}") from err
 
-        # Set up MQTT on first successful REST update
-        if not self._mqtt_setup_done:
-            await self._async_setup_mqtt()
+        # Set up MQTT on first successful REST update (or if not connected)
+        if not self.device.mqtt or not self.device.mqtt.connected:
+            await self._async_connect_mqtt()
 
         return self.device
 
     # ------------------------------------------------------------------
-    # MQTT setup
+    # MQTT — always fetch fresh credentials to avoid client_id conflicts
     # ------------------------------------------------------------------
 
-    async def _async_setup_mqtt(self) -> None:
-        """Fetch IoT cert and open MQTT connection."""
+    async def _async_connect_mqtt(self) -> None:
+        """
+        Fetch fresh IoT credentials and open a new MQTT connection.
+
+        Each call to /api/web/device/iot-cert returns a unique mqtt_client_id,
+        so there's no session-takeover conflict with the mobile app.
+        We tear down any existing connection first.
+        """
         sn = self.device.sn
+
+        # Clean up old connection
+        if self.device.mqtt:
+            await self.device.mqtt.async_disconnect()
+            self.device.mqtt = None
+
         try:
             cert_info = await self.api.async_get_iot_cert(sn)
             _LOGGER.debug(
@@ -213,22 +226,58 @@ class AirseekersCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("[%s] Could not fetch IoT cert: %s — MQTT unavailable", sn, err)
             return
 
-        mqtt = AirseekersDeviceMQTT(
+        mqtt_client = AirseekersDeviceMQTT(
             device_sn=sn,
             iot_cert_info=cert_info,
             on_message=self._on_mqtt_message,
+            on_disconnect=self._on_mqtt_disconnect,
             loop=asyncio.get_event_loop(),
         )
-        connected = await mqtt.async_connect()
+        connected = await mqtt_client.async_connect()
         if connected:
-            self.device.mqtt = mqtt
-            self._mqtt_setup_done = True
+            self.device.mqtt = mqtt_client
             _LOGGER.info("[%s] MQTT connected", sn)
         else:
-            _LOGGER.warning("[%s] MQTT connection failed — will retry on next poll", sn)
+            _LOGGER.warning("[%s] MQTT connection failed", sn)
+
+    def _on_mqtt_disconnect(self, sn: str, rc: int) -> None:
+        """
+        Called when MQTT disconnects. Schedule a reconnect with fresh credentials.
+        RC=7 (session takeover by mobile app) is expected — fresh creds fix it.
+        """
+        if rc != 0:
+            _LOGGER.info(
+                "[%s] MQTT disconnected (rc=%s) — will reconnect with fresh credentials in 10s",
+                sn, rc,
+            )
+
+            def _schedule() -> None:
+                if self._mqtt_reconnect_task and not self._mqtt_reconnect_task.done():
+                    return
+                self._mqtt_reconnect_task = self.hass.loop.create_task(
+                    self._async_reconnect_with_backoff()
+                )
+
+            self.hass.loop.call_soon_threadsafe(_schedule)
+
+    async def _async_reconnect_with_backoff(self) -> None:
+        """Reconnect with fresh IoT credentials, with exponential backoff."""
+        delay = 10
+        while True:
+            await asyncio.sleep(delay)
+            if self.device.mqtt and self.device.mqtt.connected:
+                return
+            _LOGGER.debug("[%s] Attempting MQTT reconnect with fresh credentials", self.device.sn)
+            try:
+                await self._async_connect_mqtt()
+                if self.device.mqtt and self.device.mqtt.connected:
+                    return
+            except Exception as err:
+                _LOGGER.warning("[%s] MQTT reconnect failed: %s", self.device.sn, err)
+            delay = min(delay * 2, 300)
 
     # ------------------------------------------------------------------
-    # MQTT message handler (called from executor thread via call_soon_threadsafe)
+    # MQTT message handler
     # ------------------------------------------------------------------
 
     @callback
@@ -275,8 +324,10 @@ class AirseekersCoordinator(DataUpdateCoordinator):
             updated = True
 
         elif isinstance(message, dict) and "_raw_msg_type" in message:
-            _LOGGER.debug("[%s] Unknown MQTT msg type=%s fields=%s",
-                          sn, message["_raw_msg_type"], list(message.get("_raw_fields", {}).keys()))
+            _LOGGER.debug(
+                "[%s] Unknown MQTT msg type=%s fields=%s",
+                sn, message["_raw_msg_type"], list(message.get("_raw_fields", {}).keys()),
+            )
 
         if updated:
             self.async_set_updated_data(self.device)
@@ -286,7 +337,6 @@ class AirseekersCoordinator(DataUpdateCoordinator):
     # ------------------------------------------------------------------
 
     async def async_start_task(self, task_id: str, map_id: str | None = None) -> None:
-        """Start a mowing task."""
         await self._require_mqtt()
         await self.device.mqtt.async_start_task(task_id, map_id)
 
@@ -308,12 +358,14 @@ class AirseekersCoordinator(DataUpdateCoordinator):
 
     async def _require_mqtt(self) -> None:
         if not self.device.mqtt or not self.device.mqtt.connected:
-            await self._async_setup_mqtt()
+            await self._async_connect_mqtt()
             if not self.device.mqtt or not self.device.mqtt.connected:
                 raise RuntimeError("MQTT not connected — cannot send command")
 
     async def async_unload(self) -> None:
-        """Disconnect MQTT on unload."""
+        """Disconnect MQTT and cancel reconnect on unload."""
+        if self._mqtt_reconnect_task and not self._mqtt_reconnect_task.done():
+            self._mqtt_reconnect_task.cancel()
         if self.device.mqtt:
             await self.device.mqtt.async_disconnect()
             self.device.mqtt = None
