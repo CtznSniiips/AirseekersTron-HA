@@ -114,8 +114,13 @@ class AirseekersDeviceMQTT:
         self._connack_event: asyncio.Event = asyncio.Event()
         self._connack_rc: int = -1
 
+        # Topic direction test: subscribing to as/{sn}/up causes immediate
+        # session takeover (cloud backend monitors that topic).
+        # Trying as/{sn}/down as the receive topic instead.
         self._topic_up   = MQTT_TOPIC_UP_FMT.format(sn=device_sn)
         self._topic_down = MQTT_TOPIC_DOWN_FMT.format(sn=device_sn)
+        # Wildcard to catch all messages on either direction
+        self._topic_wildcard = f"as/{device_sn}/#"
 
     # ------------------------------------------------------------------
     # Public
@@ -272,8 +277,12 @@ class AirseekersDeviceMQTT:
                 self._sn, self._cert_info.get("mqtt_client_id", ""),
             )
             self._connected = True
-            client.subscribe(self._topic_up, qos=MQTT_QOS_STATUS)
-            _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_up)
+            # Subscribe to /down (mower status) instead of /up (which triggers takeover)
+            # Also subscribe to wildcard to catch any direction
+            client.subscribe(self._topic_down, qos=MQTT_QOS_STATUS)
+            _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_down)
+            client.subscribe(self._topic_wildcard, qos=MQTT_QOS_STATUS)
+            _LOGGER.debug("[%s] Subscribed to %s", self._sn, self._topic_wildcard)
         else:
             _LOGGER.error("[%s] MQTT connect refused rc=%s: %s", self._sn, rc, _rc_description(rc))
             self._connected = False
